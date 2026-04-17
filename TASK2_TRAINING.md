@@ -6,15 +6,15 @@ I added a runnable training and inference pipeline in [task2_pipeline.py](/home/
 
 ## What I implemented
 
-The pipeline follows the task definition in the repo and the baseline notebook:
+The pipeline follows the task definition in the repo and also incorporates the useful notebook ideas in a clean CLI form:
 
 - It treats the problem as **binary classification per row**.
 - It uses a **question-level train/validation split**, so all candidates from the same question stay together and there is no leakage.
-- It converts each graph into a readable text sequence of triples such as:
-  `source -> relation -> target`
-- It builds one text input from:
-  `question + question entities + candidate answer + linearized graph`
-- It fine-tunes a Hugging Face encoder with a small classification head on top.
+- It supports three model families:
+  `linearized_text`, `graph_stats`, and `cross_attention`.
+- `linearized_text` converts each graph into a readable text sequence of triples and trains a standard transformer classifier.
+- `graph_stats` combines transformer text features with handcrafted graph statistics inspired by the notebook.
+- `cross_attention` combines transformer text features with graph node labels through a graph-aware cross-attention block inspired by the notebook.
 - It searches for the **best validation threshold** for F1 and saves that threshold with the checkpoint.
 - It writes ready-to-use TSV files for validation and test predictions.
 
@@ -38,19 +38,25 @@ Then run everything through `uv run`:
 uv run python3 task2_pipeline.py --help
 ```
 
-The default model is:
+The default encoder is:
 
 ```text
 sentence-transformers/all-mpnet-base-v2
 ```
 
-This matches the baseline notebook direction and usually works well for this kind of text-pair classification. It will download from Hugging Face the first time you run it.
+The default model family is:
+
+```text
+cross_attention
+```
+
+This is the notebook-inspired graph-aware option. It will download the encoder from Hugging Face the first time you run it.
 
 For true multi-GPU training, launch the script with Hugging Face `accelerate`.
 
 ## Train
 
-This command trains on `data/tsv/train.tsv`, creates a held-out validation split by question, saves the best checkpoint, and also writes validation predictions:
+This command trains the default `cross_attention` model on `data/tsv/train.tsv`, creates a held-out validation split by question, saves the best checkpoint, and also writes validation predictions:
 
 ```bash
 uv run python3 task2_pipeline.py train \
@@ -68,15 +74,38 @@ uv run accelerate launch --multi_gpu task2_pipeline.py train \
 
 Useful optional arguments:
 
+- `--model-type linearized_text`
+- `--model-type graph_stats`
+- `--model-type cross_attention`
 - `--model-name roberta-base`
 - `--epochs 5`
 - `--batch-size 8`
 - `--max-length 256`
+- `--node-max-length 16`
+- `--max-nodes 30`
 - `--learning-rate 2e-5`
 - `--val-ratio 0.1`
+- `--freeze-embeddings`
+- `--freeze-layers 5`
 - `--seed 42`
 
 When running with `accelerate`, `--batch-size` is the per-process batch size.
+
+Examples:
+
+```bash
+uv run python3 task2_pipeline.py train \
+  --model-type graph_stats \
+  --train-path data/tsv/train.tsv \
+  --output-dir runs/task2_graph_stats
+```
+
+```bash
+uv run accelerate launch --multi_gpu task2_pipeline.py train \
+  --model-type cross_attention \
+  --train-path data/tsv/train.tsv \
+  --output-dir runs/task2_cross_attention
+```
 
 Artifacts written to `runs/task2_mpnet/`:
 
@@ -148,3 +177,5 @@ uv run python3 task2_pipeline.py test --test-path data/tsv/test.tsv --checkpoint
 - The script does not require `pandas`, `numpy`, or `scikit-learn`.
 - If GPU memory is tight, reduce `--batch-size` first.
 - For multi-GPU runs, prefer `accelerate launch --multi_gpu ...` instead of raw `python3 ...`.
+- `graph_stats` is the lightest notebook-inspired model and is a good first comparison point.
+- `cross_attention` is the strongest notebook-inspired graph-aware model in this repo and usually needs more careful tuning of batch size, dropout, and learning rate.
