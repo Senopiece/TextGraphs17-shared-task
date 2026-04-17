@@ -258,6 +258,26 @@ class BinaryClassifier(nn.Module):
         return logits
 
 
+def maybe_wrap_data_parallel(model: nn.Module, device: torch.device) -> nn.Module:
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        return nn.DataParallel(model)
+    return model
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    if isinstance(model, nn.DataParallel):
+        return model.module
+    return model
+
+
+def normalize_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    if not state_dict:
+        return state_dict
+    if all(key.startswith("module.") for key in state_dict.keys()):
+        return {key[len("module."):]: value for key, value in state_dict.items()}
+    return state_dict
+
+
 def compute_binary_metrics(gold: Sequence[int], pred: Sequence[int]) -> Dict[str, float]:
     if len(gold) != len(pred):
         raise ValueError("Gold labels and predicted labels have different lengths.")
@@ -375,12 +395,12 @@ def run_validation(
 
 def save_checkpoint(
     output_dir: Path,
-    model: BinaryClassifier,
+    model: nn.Module,
     tokenizer,
     metadata: Dict[str, object],
 ) -> None:
     ensure_dir(output_dir)
-    torch.save(model.state_dict(), output_dir / "best_model.pt")
+    torch.save(unwrap_model(model).state_dict(), output_dir / "best_model.pt")
     tokenizer.save_pretrained(output_dir / "tokenizer")
     write_json(output_dir / "metadata.json", metadata)
 
@@ -393,8 +413,9 @@ def load_checkpoint(checkpoint_dir: Path, device: torch.device) -> Tuple[BinaryC
         dropout=float(metadata["dropout"]),
     )
     state_dict = torch.load(checkpoint_dir / "best_model.pt", map_location=device)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(normalize_state_dict_keys(state_dict))
     model.to(device)
+    model = maybe_wrap_data_parallel(model, device)
     return model, tokenizer, metadata
 
 
@@ -444,6 +465,7 @@ def train_command(args: argparse.Namespace) -> None:
     )
 
     model = BinaryClassifier(model_name=args.model_name, dropout=args.dropout).to(device)
+    model = maybe_wrap_data_parallel(model, device)
 
     num_pos = sum(label_from_row(row) for row in train_rows)
     num_neg = len(train_rows) - num_pos
@@ -468,6 +490,8 @@ def train_command(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "device": str(device),
+                "num_visible_gpus": torch.cuda.device_count() if device.type == "cuda" else 0,
+                "data_parallel": isinstance(model, nn.DataParallel),
                 "num_train_rows": len(train_rows),
                 "num_val_rows": len(val_rows),
                 "num_train_batches": len(train_loader),
