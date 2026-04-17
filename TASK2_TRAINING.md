@@ -46,7 +46,7 @@ sentence-transformers/all-mpnet-base-v2
 
 This matches the baseline notebook direction and usually works well for this kind of text-pair classification. It will download from Hugging Face the first time you run it.
 
-If multiple CUDA GPUs are visible, the script automatically uses all of them through PyTorch `DataParallel`.
+For true multi-GPU training, launch the script with Hugging Face `accelerate`.
 
 ## Train
 
@@ -54,6 +54,14 @@ This command trains on `data/tsv/train.tsv`, creates a held-out validation split
 
 ```bash
 uv run python3 task2_pipeline.py train \
+  --train-path data/tsv/train.tsv \
+  --output-dir runs/task2_mpnet
+```
+
+For 2 GPUs, use:
+
+```bash
+uv run accelerate launch --multi_gpu task2_pipeline.py train \
   --train-path data/tsv/train.tsv \
   --output-dir runs/task2_mpnet
 ```
@@ -68,7 +76,7 @@ Useful optional arguments:
 - `--val-ratio 0.1`
 - `--seed 42`
 
-When running on 2 GPUs, `--batch-size` is the total batch size before PyTorch splits it across devices.
+When running with `accelerate`, `--batch-size` is the per-process batch size.
 
 Artifacts written to `runs/task2_mpnet/`:
 
@@ -139,4 +147,4 @@ uv run python3 task2_pipeline.py test --test-path data/tsv/test.tsv --checkpoint
 - Some questions have more than one correct candidate, so this is not implemented as single-choice ranking.
 - The script does not require `pandas`, `numpy`, or `scikit-learn`.
 - If GPU memory is tight, reduce `--batch-size` first.
-- If 2 GPUs are visible, the training script uses both automatically. You can verify that from the first JSON status line, which prints `num_visible_gpus` and whether `data_parallel` is enabled.
+- For multi-GPU runs, prefer `accelerate launch --multi_gpu ...` instead of raw `python3 ...`.

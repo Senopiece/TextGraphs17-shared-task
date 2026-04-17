@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
@@ -220,7 +221,7 @@ class Collator:
 
     def __call__(self, batch: Sequence[Example]) -> Dict[str, torch.Tensor | List[str]]:
         texts = [example.text for example in batch]
-        sample_ids = [example.sample_id for example in batch]
+        sample_ids = torch.tensor([int(example.sample_id) for example in batch], dtype=torch.long)
         encoded = self.tokenizer(
             texts,
             padding=True,
@@ -256,18 +257,6 @@ class BinaryClassifier(nn.Module):
         cls_embedding = outputs.last_hidden_state[:, 0, :]
         logits = self.classifier(cls_embedding).squeeze(-1)
         return logits
-
-
-def maybe_wrap_data_parallel(model: nn.Module, device: torch.device) -> nn.Module:
-    if device.type == "cuda" and torch.cuda.device_count() > 1:
-        return nn.DataParallel(model)
-    return model
-
-
-def unwrap_model(model: nn.Module) -> nn.Module:
-    if isinstance(model, nn.DataParallel):
-        return model.module
-    return model
 
 
 def normalize_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -324,50 +313,49 @@ def find_best_threshold(gold: Sequence[int], probabilities: Sequence[float]) -> 
     return best_threshold, best_metrics
 
 
-def move_batch_to_device(batch: Dict[str, torch.Tensor | List[str]], device: torch.device) -> Dict[str, torch.Tensor | List[str]]:
-    moved: Dict[str, torch.Tensor | List[str]] = {}
-    for key, value in batch.items():
-        if isinstance(value, torch.Tensor):
-            moved[key] = value.to(device)
-        else:
-            moved[key] = value
-    return moved
-
-
 def run_validation(
-    model: BinaryClassifier,
+    accelerator: Accelerator,
+    model: nn.Module,
     dataloader: DataLoader,
-    device: torch.device,
+    criterion: nn.Module,
     threshold: float | None = None,
     progress_desc: str | None = None,
 ) -> Dict[str, object]:
     model.eval()
     losses: List[float] = []
-    sample_ids: List[str] = []
+    sample_ids: List[int] = []
     gold_labels: List[int] = []
     probabilities: List[float] = []
 
-    criterion = nn.BCEWithLogitsLoss()
     with torch.no_grad():
         iterator: Iterable[Dict[str, torch.Tensor | List[str]]]
         if progress_desc is not None:
-            iterator = tqdm(dataloader, desc=progress_desc, leave=False)
+            iterator = tqdm(
+                dataloader,
+                desc=progress_desc,
+                leave=False,
+                disable=not accelerator.is_local_main_process,
+            )
         else:
             iterator = dataloader
 
         for batch in iterator:
-            batch = move_batch_to_device(batch, device)
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
             )
-            probs = torch.sigmoid(logits).detach().cpu().tolist()
-            probabilities.extend(float(x) for x in probs)
-            sample_ids.extend(batch["sample_ids"])
+            probs = torch.sigmoid(logits)
+            gathered_probs = accelerator.gather_for_metrics(probs)
+            gathered_sample_ids = accelerator.gather_for_metrics(batch["sample_ids"])
+            probabilities.extend(float(x) for x in gathered_probs.detach().cpu().tolist())
+            sample_ids.extend(int(x) for x in gathered_sample_ids.detach().cpu().tolist())
             if "labels" in batch:
                 labels = batch["labels"]
-                gold_labels.extend(int(x) for x in labels.detach().cpu().tolist())
-                losses.append(float(criterion(logits, labels).item()))
+                loss = criterion(logits, labels)
+                gathered_labels = accelerator.gather_for_metrics(labels)
+                gathered_loss = accelerator.gather_for_metrics(loss.detach().unsqueeze(0))
+                gold_labels.extend(int(x) for x in gathered_labels.detach().cpu().tolist())
+                losses.extend(float(x) for x in gathered_loss.detach().cpu().tolist())
 
     result: Dict[str, object] = {
         "sample_ids": sample_ids,
@@ -396,26 +384,29 @@ def run_validation(
 def save_checkpoint(
     output_dir: Path,
     model: nn.Module,
+    accelerator: Accelerator,
     tokenizer,
     metadata: Dict[str, object],
 ) -> None:
     ensure_dir(output_dir)
-    torch.save(unwrap_model(model).state_dict(), output_dir / "best_model.pt")
+    torch.save(accelerator.unwrap_model(model).state_dict(), output_dir / "best_model.pt")
     tokenizer.save_pretrained(output_dir / "tokenizer")
     write_json(output_dir / "metadata.json", metadata)
 
 
-def load_checkpoint(checkpoint_dir: Path, device: torch.device) -> Tuple[BinaryClassifier, object, Dict[str, object]]:
+def load_checkpoint(
+    checkpoint_dir: Path,
+    accelerator: Accelerator,
+) -> Tuple[nn.Module, object, Dict[str, object]]:
     metadata = read_json(checkpoint_dir / "metadata.json")
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir / "tokenizer")
     model = BinaryClassifier(
         model_name=str(metadata["model_name"]),
         dropout=float(metadata["dropout"]),
     )
-    state_dict = torch.load(checkpoint_dir / "best_model.pt", map_location=device)
+    state_dict = torch.load(checkpoint_dir / "best_model.pt", map_location=accelerator.device)
     model.load_state_dict(normalize_state_dict_keys(state_dict))
-    model.to(device)
-    model = maybe_wrap_data_parallel(model, device)
+    model.to(accelerator.device)
     return model, tokenizer, metadata
 
 
@@ -430,7 +421,8 @@ def create_rows_from_saved_split(train_rows: Sequence[Dict[str, str]], split_pay
 
 def train_command(args: argparse.Namespace) -> None:
     set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum_steps)
+    device = accelerator.device
 
     train_path = Path(args.train_path)
     output_dir = Path(args.output_dir)
@@ -465,7 +457,6 @@ def train_command(args: argparse.Namespace) -> None:
     )
 
     model = BinaryClassifier(model_name=args.model_name, dropout=args.dropout).to(device)
-    model = maybe_wrap_data_parallel(model, device)
 
     num_pos = sum(label_from_row(row) for row in train_rows)
     num_neg = len(train_rows) - num_pos
@@ -482,25 +473,30 @@ def train_command(args: argparse.Namespace) -> None:
         num_warmup_steps=warmup_steps,
         num_training_steps=total_optimizer_steps,
     )
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
 
     best_f1 = -1.0
     best_metadata: Dict[str, object] | None = None
 
-    print(
-        json.dumps(
-            {
-                "device": str(device),
-                "num_visible_gpus": torch.cuda.device_count() if device.type == "cuda" else 0,
-                "data_parallel": isinstance(model, nn.DataParallel),
-                "num_train_rows": len(train_rows),
-                "num_val_rows": len(val_rows),
-                "num_train_batches": len(train_loader),
-                "num_val_batches": len(val_loader),
-            },
-            ensure_ascii=True,
-        ),
-        flush=True,
-    )
+    if accelerator.is_main_process:
+        print(
+            json.dumps(
+                {
+                    "device": str(device),
+                    "num_visible_gpus": torch.cuda.device_count() if device.type == "cuda" else 0,
+                    "accelerate_processes": accelerator.num_processes,
+                    "distributed_type": str(accelerator.distributed_type),
+                    "num_train_rows": len(train_rows),
+                    "num_val_rows": len(val_rows),
+                    "num_train_batches": len(train_loader),
+                    "num_val_batches": len(val_loader),
+                },
+                ensure_ascii=True,
+            ),
+            flush=True,
+        )
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -510,22 +506,20 @@ def train_command(args: argparse.Namespace) -> None:
             train_loader,
             desc=f"Epoch {epoch}/{args.epochs} [train]",
             leave=True,
+            disable=not accelerator.is_local_main_process,
         )
 
         for step, batch in enumerate(progress_bar, start=1):
-            batch = move_batch_to_device(batch, device)
-            logits = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-            )
-            loss = criterion(logits, batch["labels"])
-            loss = loss / args.grad_accum_steps
-            loss.backward()
-            running_loss += float(loss.item())
-
-            should_step = step % args.grad_accum_steps == 0 or step == len(train_loader)
-            if should_step:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            with accelerator.accumulate(model):
+                logits = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                )
+                loss = criterion(logits, batch["labels"])
+                running_loss += float(loss.detach().item())
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -536,71 +530,81 @@ def train_command(args: argparse.Namespace) -> None:
             )
 
         val_result = run_validation(
+            accelerator=accelerator,
             model=model,
             dataloader=val_loader,
-            device=device,
+            criterion=criterion,
             threshold=None,
             progress_desc=f"Epoch {epoch}/{args.epochs} [val]",
         )
-        val_metrics = val_result["metrics"]
-        threshold = float(val_result["threshold"])
-        train_loss = running_loss / max(1, len(train_loader))
-        val_loss = val_result["loss"]
+        if accelerator.is_main_process:
+            val_metrics = val_result["metrics"]
+            threshold = float(val_result["threshold"])
+            train_loss = running_loss / max(1, len(train_loader))
+            val_loss = val_result["loss"]
 
-        epoch_summary = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "val_precision": val_metrics["precision"],
-            "val_recall": val_metrics["recall"],
-            "val_f1": val_metrics["f1"],
-            "val_accuracy": val_metrics["accuracy"],
-            "threshold": threshold,
-        }
-        print(json.dumps(epoch_summary, ensure_ascii=True), flush=True)
-
-        if val_metrics["f1"] > best_f1:
-            best_f1 = val_metrics["f1"]
-            best_metadata = {
-                "model_name": args.model_name,
-                "dropout": args.dropout,
-                "max_length": args.max_length,
+            epoch_summary = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_precision": val_metrics["precision"],
+                "val_recall": val_metrics["recall"],
+                "val_f1": val_metrics["f1"],
+                "val_accuracy": val_metrics["accuracy"],
                 "threshold": threshold,
-                "seed": args.seed,
-                "val_ratio": args.val_ratio,
-                "train_path": str(train_path),
-                "num_train_rows": len(train_rows),
-                "num_val_rows": len(val_rows),
-                "num_train_questions": len(split_payload["train_questions"]),
-                "num_val_questions": len(split_payload["val_questions"]),
-                "best_metrics": val_metrics,
-                "best_epoch": epoch,
-                "pos_weight": pos_weight_value,
             }
-            save_checkpoint(output_dir=output_dir, model=model, tokenizer=tokenizer, metadata=best_metadata)
-            save_prediction_rows(
-                output_path=output_dir / "val_predictions.tsv",
-                sample_ids=val_result["sample_ids"],
-                probabilities=val_result["probabilities"],
-                predictions=val_result["predictions"],
-                labels=val_result["labels"],
-            )
+            print(json.dumps(epoch_summary, ensure_ascii=True), flush=True)
 
-    if best_metadata is None:
-        raise RuntimeError("Training ended without producing a checkpoint.")
+            if val_metrics["f1"] > best_f1:
+                best_f1 = val_metrics["f1"]
+                best_metadata = {
+                    "model_name": args.model_name,
+                    "dropout": args.dropout,
+                    "max_length": args.max_length,
+                    "threshold": threshold,
+                    "seed": args.seed,
+                    "val_ratio": args.val_ratio,
+                    "train_path": str(train_path),
+                    "num_train_rows": len(train_rows),
+                    "num_val_rows": len(val_rows),
+                    "num_train_questions": len(split_payload["train_questions"]),
+                    "num_val_questions": len(split_payload["val_questions"]),
+                    "best_metrics": val_metrics,
+                    "best_epoch": epoch,
+                    "pos_weight": pos_weight_value,
+                }
+                save_checkpoint(
+                    output_dir=output_dir,
+                    model=model,
+                    accelerator=accelerator,
+                    tokenizer=tokenizer,
+                    metadata=best_metadata,
+                )
+                save_prediction_rows(
+                    output_path=output_dir / "val_predictions.tsv",
+                    sample_ids=val_result["sample_ids"],
+                    probabilities=val_result["probabilities"],
+                    predictions=val_result["predictions"],
+                    labels=val_result["labels"],
+                )
+        accelerator.wait_for_everyone()
 
-    print(
-        json.dumps(
-            {"best_checkpoint_dir": str(output_dir), "best_metrics": best_metadata["best_metrics"]},
-            ensure_ascii=True,
-        ),
-        flush=True,
-    )
+    if accelerator.is_main_process:
+        if best_metadata is None:
+            raise RuntimeError("Training ended without producing a checkpoint.")
+
+        print(
+            json.dumps(
+                {"best_checkpoint_dir": str(output_dir), "best_metrics": best_metadata["best_metrics"]},
+                ensure_ascii=True,
+            ),
+            flush=True,
+        )
 
 
 def save_prediction_rows(
     output_path: Path,
-    sample_ids: Sequence[str],
+    sample_ids: Sequence[int],
     probabilities: Sequence[float],
     predictions: Sequence[int],
     labels: Sequence[int] | None = None,
@@ -623,10 +627,10 @@ def save_prediction_rows(
 
 
 def validate_command(args: argparse.Namespace) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    accelerator = Accelerator()
     checkpoint_dir = Path(args.checkpoint_dir)
 
-    model, tokenizer, metadata = load_checkpoint(checkpoint_dir=checkpoint_dir, device=device)
+    model, tokenizer, metadata = load_checkpoint(checkpoint_dir=checkpoint_dir, accelerator=accelerator)
     train_rows = read_tsv(Path(args.train_path))
     split_payload = read_json(checkpoint_dir / "split.json")
     _, val_rows = create_rows_from_saved_split(train_rows, split_payload)
@@ -640,28 +644,32 @@ def validate_command(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         collate_fn=collator,
     )
+    criterion = nn.BCEWithLogitsLoss()
+    model, val_loader = accelerator.prepare(model, val_loader)
 
     result = run_validation(
+        accelerator=accelerator,
         model=model,
         dataloader=val_loader,
-        device=device,
+        criterion=criterion,
         threshold=float(metadata["threshold"]),
     )
-    output_path = Path(args.output_path) if args.output_path else checkpoint_dir / "val_predictions.tsv"
-    save_prediction_rows(
-        output_path=output_path,
-        sample_ids=result["sample_ids"],
-        probabilities=result["probabilities"],
-        predictions=result["predictions"],
-        labels=result["labels"],
-    )
-    print(json.dumps({"validation_metrics": result["metrics"], "output_path": str(output_path)}, ensure_ascii=True))
+    if accelerator.is_main_process:
+        output_path = Path(args.output_path) if args.output_path else checkpoint_dir / "val_predictions.tsv"
+        save_prediction_rows(
+            output_path=output_path,
+            sample_ids=result["sample_ids"],
+            probabilities=result["probabilities"],
+            predictions=result["predictions"],
+            labels=result["labels"],
+        )
+        print(json.dumps({"validation_metrics": result["metrics"], "output_path": str(output_path)}, ensure_ascii=True))
 
 
 def test_command(args: argparse.Namespace) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    accelerator = Accelerator()
     checkpoint_dir = Path(args.checkpoint_dir)
-    model, tokenizer, metadata = load_checkpoint(checkpoint_dir=checkpoint_dir, device=device)
+    model, tokenizer, metadata = load_checkpoint(checkpoint_dir=checkpoint_dir, accelerator=accelerator)
 
     test_rows = read_tsv(Path(args.test_path))
     test_dataset = Task2Dataset(test_rows, include_labels=False)
@@ -673,22 +681,26 @@ def test_command(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         collate_fn=collator,
     )
+    criterion = nn.BCEWithLogitsLoss()
+    model, test_loader = accelerator.prepare(model, test_loader)
 
     result = run_validation(
+        accelerator=accelerator,
         model=model,
         dataloader=test_loader,
-        device=device,
+        criterion=criterion,
         threshold=float(metadata["threshold"]),
     )
-    output_path = Path(args.output_path)
-    save_prediction_rows(
-        output_path=output_path,
-        sample_ids=result["sample_ids"],
-        probabilities=result["probabilities"],
-        predictions=result["predictions"],
-        labels=None,
-    )
-    print(json.dumps({"test_output_path": str(output_path), "threshold": result["threshold"]}, ensure_ascii=True))
+    if accelerator.is_main_process:
+        output_path = Path(args.output_path)
+        save_prediction_rows(
+            output_path=output_path,
+            sample_ids=result["sample_ids"],
+            probabilities=result["probabilities"],
+            predictions=result["predictions"],
+            labels=None,
+        )
+        print(json.dumps({"test_output_path": str(output_path), "threshold": result["threshold"]}, ensure_ascii=True))
 
 
 def main() -> None:
