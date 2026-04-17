@@ -5,6 +5,7 @@ description = "Training and inference pipeline for TextGraphs17 shared task 2."
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.1.0",
+  "accelerate>=0.34.0",
   "transformers>=4.40.0",
   "tqdm>=4.66.0",
 ]

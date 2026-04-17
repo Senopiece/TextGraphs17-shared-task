@@ -14,6 +14,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
@@ -421,7 +422,11 @@ def create_rows_from_saved_split(train_rows: Sequence[Dict[str, str]], split_pay
 
 def train_command(args: argparse.Namespace) -> None:
     set_seed(args.seed)
-    accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum_steps)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.grad_accum_steps,
+        kwargs_handlers=[ddp_kwargs],
+    )
     device = accelerator.device
 
     train_path = Path(args.train_path)
@@ -627,7 +632,8 @@ def save_prediction_rows(
 
 
 def validate_command(args: argparse.Namespace) -> None:
-    accelerator = Accelerator()
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     checkpoint_dir = Path(args.checkpoint_dir)
 
     model, tokenizer, metadata = load_checkpoint(checkpoint_dir=checkpoint_dir, accelerator=accelerator)
@@ -667,7 +673,8 @@ def validate_command(args: argparse.Namespace) -> None:
 
 
 def test_command(args: argparse.Namespace) -> None:
-    accelerator = Accelerator()
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     checkpoint_dir = Path(args.checkpoint_dir)
     model, tokenizer, metadata = load_checkpoint(checkpoint_dir=checkpoint_dir, accelerator=accelerator)
 
